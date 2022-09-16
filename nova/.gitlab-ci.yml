@@ -1,0 +1,221 @@
+default:
+  image: 666959965112.dkr.ecr.eu-west-1.amazonaws.com/sys/node:14-alpine
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - .npm/
+  before_script:
+    - npm ci --prefer-offline --cache .npm
+
+workflow:
+  rules:
+    # don't create a pipeline if it's a commit pipeline, on a branch and that branch has open merge requests (we will get an MR build instead)
+    - if: $CI_MERGE_REQUEST_IID
+    - if: $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+.common_rules:
+  master-release:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+    - if: '$CI_COMMIT_BRANCH =~ /^release\/.*$/'
+  feature:
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*$/'
+
+
+stages:
+  - build
+  - test
+  - sonar:analysis
+  - deploy (dev)
+  - docker
+  - trigger:qa_feature
+
+# =============================BUILD===========================================
+
+build-app:
+  allow_failure: false
+  interruptible: true
+  stage: build
+  tags:
+    - musement-dev
+  artifacts:
+    paths:
+      - .output/public
+      - .nuxt/tsconfig.json
+  script:
+    - npm run build
+    - npm prune --production
+
+# =============================TEST============================================
+
+test-unit:
+  allow_failure: false
+  interruptible: true
+  stage: test
+  tags:
+    - musement-dev
+  coverage: /All\sfiles.*?\s+(\d+.\d+)/
+  artifacts:
+    when: always
+    paths:
+      - unit.xml
+      - coverage
+    reports:
+      junit: unit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+  script:
+    - npm run test:unit:coverage
+
+test-integration:
+  allow_failure: false
+  interruptible: true
+  stage: test
+  image: mcr.microsoft.com/playwright:v1.24.0-focal
+  tags:
+    - musement-dev
+  artifacts:
+    when: always
+    paths:
+      - integration.xml
+    reports:
+      junit: integration.xml
+  script:
+    - npx playwright install --with-deps
+    - npm run test:integration
+
+    
+# =============================SONAR==========================================
+
+sonar:
+  allow_failure: false
+  interruptible: true
+  stage: sonar:analysis
+  tags:
+    - musement-dev
+  before_script:
+    - apk add p7zip openjdk11-jre
+    - export SONAR_SCANNER_VERSION=4.6.2.2472
+    - wget https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${SONAR_SCANNER_VERSION}.zip -P /tmp
+    - 7za x /tmp/sonar-scanner-cli-${SONAR_SCANNER_VERSION}.zip -o/opt
+    - rm /tmp/sonar-scanner-cli-${SONAR_SCANNER_VERSION}.zip 
+    - ln -s /opt/sonar-scanner-${SONAR_SCANNER_VERSION}/bin/sonar-scanner /usr/local/bin/sonar-scanner
+  script:
+    - pwd
+    - ls
+    - npm run test:sonar
+
+
+# =============================DEPLOY==========================================
+
+deploy-dev:
+  image: 961225121166.dkr.ecr.eu-central-1.amazonaws.com/deploybasetools:v.0.2.1
+  before_script:
+    - ''
+  stage: deploy (dev)
+  tags:
+    - musement-dev
+  dependencies: 
+    - build-app
+  script:
+    - export AWS_ACCESS_KEY_ID=${TUIDS_TEST_AWS_ACCESS_KEY_ID}
+    - export AWS_SECRET_ACCESS_KEY=${TUIDS_TEST_AWS_SECRET_ACCESS_KEY}
+    - export AWS_REGION=eu-central-1
+    - export S3_BUCKET=tuimm-test-s3-frontend-cms
+    #
+    - aws s3 sync .output/public s3://$S3_BUCKET/
+  only:
+    - master
+
+pages:
+  stage: deploy (dev)
+  tags:
+    - musement-dev
+  dependencies: 
+    - build-app
+  script:
+    - npm run build-storybook -- -o public
+  artifacts:
+    paths:
+      - public
+  only:
+    - master
+
+# =============================DOCKER==========================================
+
+build-app-docker:
+  stage: build
+  allow_failure: false
+  interruptible: true
+  tags:
+    - musement-dev
+  artifacts:
+    paths:
+      - .output/public
+      - .nuxt/tsconfig.json
+  script:
+    - cp -vf image/.env.docker .env  
+    - npm run build
+    - npm prune --production
+
+docker:publish-merge-requests:
+  image: 961225121166.dkr.ecr.eu-central-1.amazonaws.com/deploybasetools:v.0.2.1
+  stage: docker
+  dependencies: 
+    - build-app-docker
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - export AWS_ACCESS_KEY_ID=${TUIDS_SHARED_AWS_ACCESS_KEY_ID}
+    - export AWS_SECRET_ACCESS_KEY=${TUIDS_SHARED_AWS_SECRET_ACCESS_KEY}
+    - aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin 961225121166.dkr.ecr.eu-central-1.amazonaws.com
+    - image_tag=$(echo "$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME" | sed s/\\//_/)
+    - echo "image_tag="$image_tag >> build.env
+    - docker build --pull -t "$CI_REGISTRY_IMAGE":"$image_tag" .
+    - docker push "$CI_REGISTRY_IMAGE":"$image_tag"
+  artifacts:
+    reports:
+      dotenv: build.env
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+docker:publish-master:
+  image: 961225121166.dkr.ecr.eu-central-1.amazonaws.com/deploybasetools:v.0.2.1
+  stage: docker
+  dependencies: 
+    - build-app-docker
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - export AWS_ACCESS_KEY_ID=${TUIDS_SHARED_AWS_ACCESS_KEY_ID}
+    - export AWS_SECRET_ACCESS_KEY=${TUIDS_SHARED_AWS_SECRET_ACCESS_KEY}
+    - aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin 961225121166.dkr.ecr.eu-central-1.amazonaws.com
+    # TODO Check the final branching and deployment strategy is defined if it makes sense
+    - docker build --pull -t "$CI_REGISTRY_IMAGE":"latest" .
+    - docker push "$CI_REGISTRY_IMAGE":"latest"
+  rules:
+    - !reference [.common_rules, master-release]
+
+# =============================TRIGGER-QA======================================
+
+trigger_qa_feature:
+  stage: trigger:qa_feature
+  allow_failure: true
+  variables:
+    environment: feature
+    image_tag: $image_tag
+    commit: $CI_COMMIT_SHA
+    project: $CI_PROJECT_NAME
+    timeout: 10
+  trigger:
+    project: dx/qa/offer-factory/nova-qa
+    branch: master
+    strategy: depend
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+
